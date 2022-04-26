@@ -1,0 +1,661 @@
+---
+title: "Analysis of RNA-Seq data with Bioconductor packages"
+subtitle: "Functional Genomics"
+author: "Marija Rakić, Ivana Štrbac"
+date: "11/Apr/2022"
+output: 
+    html_document:
+        theme: flatly
+        highlight: tango
+        toc: yes
+        toc_float: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,include=T,error=F,warning = F,message=F)
+```
+
+# Summary of the Experimental Data
+
+Researchers were studying the next generation RNAseq from human hepatic sinusoidal endothelial cells (EC) and mouse sinusoidal EC plated on soft vs hard gels.
+
+Findings from the next generation RNAseq data from human hepatic sinusoidal endothelial cells plated on soft vs hard gels reveal the **chemokine CXCL1** being among the top up-regulated genes from granulocyte and agranulocyte migration/diapedesis pathway.
+
+The expression profiling was done by high throughput sequencing.
+
+# Dataset
+
+```{r include=FALSE}
+installandload<-function(
+  normalpackages=c("rlang", "tidyverse", "readxl", "writexl","lubridate","stringr","esquisse","miniUI","pheatmap","RColorBrewer","hexbin","BiocManager","reshape2","ggnewscale","ggbeeswarm", "kableExtra"),
+  biocpackages=c("DESeq2","SummarizedExperiment","GEOquery","biomaRt","org.Hs.eg.db","org.Mm.eg.db","pathview","clusterProfiler","EnhancedVolcano","apeglm","genefilter","tximport","tximeta","GenomicFeatures","edgeR")){
+  new.packages <- normalpackages[!(normalpackages %in% installed.packages()[,"Package"])]
+  if(length(new.packages)) {install.packages(new.packages,dependencies =T,quiet = T)}
+  new.bpackages <- biocpackages[!(biocpackages %in% installed.packages()[,"Package"])]
+  if(length(new.bpackages)) BiocManager::install(new.bpackages,update=T,ask=F)
+  all<-c(normalpackages,biocpackages)
+  invisible(lapply(all,function(x){
+    if(require(x,character.only=T,quietly=T)) library(x, quietly=T,character.only=T)}))
+  message("The packages")
+  print(all[all %in% installed.packages()[,"Package"]])
+  message("are loaded")
+}
+installandload()
+```
+
+```{r results='hide', comment=NA, message=FALSE}
+# Importing the Dataset
+GEOid="GSE198462"
+gse<-getGEO("GSE198462",GSEMatrix =TRUE)[[1]]
+se = as(gse, "SummarizedExperiment")
+metadata(se)
+se@metadata
+se@colData
+
+if("GSE198462" %in% list.files()){"you already have it"}else{getGEOSuppFiles("GSE198462")}
+
+# Creating a Single Dataframe
+df1<-read.table("GSE198462/GSE198462_GeneCount_human.tsv.gz", skip=0, sep = "\t", header=TRUE)
+df1<-subset(df1, select = -c(1,4,5,6)) #Removing unwanted columns
+
+df1$GeneName[duplicated(df1$GeneName)] #Checking for duplicate genes
+length(unique(df1$GeneName)) #Unique
+
+
+df1%>%group_by(GeneName)%>%summarize_if(is.numeric,sum)%>%as.data.frame->df1a
+df1a%>%head
+df1b<-df1a[,-1] # New data frame, without GeneName column
+rownames(df1b)<-df1a[,1] # Setting GeneName column values as rownames in df1b
+df1b%>%head
+colnames(df1b)<-c("SOFT_6h_1","SOFT_6h_2","SOFT_6h_3", "HARD_6h_1","HARD_6h_2", "HARD_6h_3", "SOFT_12h_1", "SOFT_12h_2","SOFT_12h_3","HARD_12h_1","HARD_12h_2","HARD_12h_3") # Shortening names - removing "Xnm_HHSEC" 
+se@colData%>%rownames 
+rownames(se@colData)<-colnames(df1b) # Setting column names from df1b as rownames of se@colData
+
+# Our groups
+se@colData$treatment.ch1 
+se@colData$treatment.ch1<-factor(str_replace_all(se@colData$treatment.ch1, "[^A-Za-z0-9_]", "."))
+se@colData$characteristics_ch1.1 
+se@colData$characteristics_ch1.1<-factor(str_replace_all(se@colData$characteristics_ch1.1, "[^A-Za-z0-9_]", "."))
+
+# Creating a Big Dataset
+ddsfresh <- DESeqDataSetFromMatrix(countData = df1b,
+                                    colData = se@colData,
+                                    design = ~ characteristics_ch1.1,
+                                    metadata = metadata(se))
+```
+
+```{r message=FALSE}
+df1b %>% head(5) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+## Transformation
+
+The package DESeq2 has two methods for transforming the data into a form which is more suitable for visualization of data - variance-stabilizing transformation (VST) and regularized logarithm (rlog).
+
+For genes with high counts, both the VST and the rlog will give similar result to the ordinary log2 transformation of normalized counts. For genes with lower counts, however, the values are shrunken towards a middle value.
+
+Of the two previously mentioned functions, VST is faster to compute in comparison with rlog. It is less sensitive to high count outliers. The rlog function tends to work well on small datasets (n \< 30), potentially outperforming the VST when there is a wide range of sequencing depth across samples (an order of magnitude difference).
+
+Since we saw that some values are 0, we want to remove any such values from the data set, with filtering, we can obtain such datasets. Below we have the number of rows before filtering.
+
+```{r comment=NA, message=FALSE}
+dds <- ddsfresh
+nrow(dds)
+```
+
+The number of rows after filtering is the following:
+
+```{r comment=NA, message=FALSE}
+keep <- rowSums(counts(dds)) > 1 # Here, we are removing 0 values
+dds <- dds[keep,]
+nrow(dds)
+```
+
+The new dataset will be used for the rest of the analysis.
+
+### VST
+
+This is a wrapper for the varianceStabilizingTransformation (VST) that provides much faster estimation of the dispersion trend used to determine the formula for the VST. The speed-up is accomplished by subsetting to a smaller number of genes in order to estimate this dispersion trend. The subset of genes is chosen deterministically, to span the range of genes' mean normalized count.
+
+As a result we can see transformed (variance stabilized) expression values.
+
+```{r comment=NA, message=FALSE}
+vsd <- vst(dds, blind = FALSE)
+assay(vsd) %>% head(3) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F, latex_options = "scale_down")
+```
+
+### Rlog
+
+This function transforms the count data to the log2 scale in a way which minimizes differences between samples for rows with small counts, and which normalizes with respect to library size.
+
+```{r comment=NA, message=FALSE}
+rld <- rlog(dds, blind = FALSE)
+assay(rld) %>% head(3) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F, latex_options = "scale_down")
+```
+
+In previous functions, blind was set to FALSE, which means that differences between cell lines and treatment will not contribute to the expected variance-mean trend of the experiment. 
+
+### Visualization of the Transformation
+
+In the following plot are shown scatterplots using the log2 transform of normalized counts (left), using the VST (middle), and using the rlog (right). We added 1 in the log2 function to avoid taking the log of zero.
+
+```{r comment=NA, message=FALSE}
+dds2 <- estimateSizeFactors(dds)
+df <- bind_rows(
+  as.data.frame(log2(counts(dds2, normalized=TRUE)[, 1:2]+1)) %>%
+    mutate(transformation = "log2(x + 1)"),
+  as.data.frame(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"),
+  as.data.frame(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog"))
+colnames(df)[1:2] <- c("x", "y")  
+lvls <- c("log2(x + 1)", "vst", "rlog")
+df$transformation <- factor(df$transformation, levels=lvls)
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation) +
+  ggtitle("Results of Transformation") + 
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+While the rlog is on roughly the same scale as the log2 counts, the VST has a upward shift for the smaller values.
+
+### Sample Distances and Heatmap
+
+The first step is using the function *dist* to calculate the Euclidean distance between samples. To ensure we have a roughly equal contribution from all genes, we use it on the VST data. We need to transpose the matrix of values using *t*, because the *dist* function expects the different samples to be rows of its argument, and different dimensions (here, genes) to be columns.
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists) # So that we have symmetric values inserted in the matrix 
+rownames(sampleDistMatrix) <-  paste(vsd$genotype.ch1,vsd$characteristics_ch1.1, sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(8, "Blues")) )(225)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors, main = "Euclidean Distance Between Samples")
+```
+
+The distance between the groups is lower than the distance between the group members. Therefore, we observe four small clusters, which are clustering near the main diagonal. That indicates that, indeed, the groupings are occurring between group members in dependence of the treatment. Lighter color squares (lilac) are indicating that the distance between different groups is high, as mentioned, and the purple color squares are indicating smaller distances between the members of the same group. Of course, the distance between the same sample is 0, hence the color is the darkest.
+
+Another way to visualize sample-to-sample distances is a principal components analysis (PCA), as well as the multidimensional scaling (MDS) function. Multidimensional scaling (MDS) is a means of visualizing the level of similarity of individual cases of a dataset.
+
+This is useful when we don't have a matrix of data, but only a matrix of distances. Here we compute the MDS for the distances calculated from the VST data. Below we can see the plots.
+
+### PCA Plot
+
+In this method, the data points are projected onto the 2D plane such that they spread out in the two directions that explain most of the differences (figure below). The x-axis is the direction that separates the data points the most. The values of the samples in this direction are written PC1. The y-axis is a direction (it must be orthogonal - perpendicular - to the first direction) that separates the data the second most. The values of the samples in this direction are written PC2. The percent of the total variance that is contained in the direction is printed in the axis label. These percentages do not add to 100%, because there are more dimensions that contain the remaining variance.
+
+Each unique combination of treatment and cell line is given its own color, so we have two different.
+
+```{r comment=NA, message=FALSE}
+plotPCA(vsd, intgroup = c("treatment.ch1","characteristics_ch1.1"))
+```
+
+### MDS Plot
+
+Another plot, multidimensional scaling (MDS), is useful when we don't have a matrix of data, but only a matrix of distances. Here we compute the MDS for the distances calculated from the rlog transformed counts and plot these in a figure below.
+
+This method, unlike PCA, does not show the percent of variance explained by the individual components.
+
+```{r comment=NA, message=FALSE}
+mds <- as.data.frame(colData(vsd))  %>%
+  cbind(cmdscale(sampleDistMatrix))
+ggplot(mds, aes(x = `1`, y = `2`, color = treatment.ch1, shape = characteristics_ch1.1)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("Multidimensional Scaling with VST data")
+```
+
+We can still see the clustering pattern as in the heatmap, in both PCA and MDS plots, as expected. Two groups are clustering on the opposite sides of the x-axis. The peach color is, as it is written in the legend, for the samples plated on hard gel, which corresponds to the circle shape, and the blue color, with the triangle shape is used to present samples plated on soft gel. We can see relation between PCA and MDS plots.
+
+# Differential Expression Analysis
+
+## Results Table
+
+### Summary of the Results
+
+```{r comment=NA, message=FALSE}
+dds<-DESeq(dds)
+res<-results(dds)
+res<-results(dds, contrast=c("characteristics_ch1.1", "treatment..Plated.on.Soft.get", "treatment..Plated.on.Hard.gel"))
+#mcols(res, use.names = TRUE)
+summary(res)
+```
+
+### Filtering the Results
+
+Using R functions, we can lower the false discovery rate threshold. If we use the threshold as 0.05, the results can be seen as in the table below.
+
+If we want to raise the log2 fold change threshold, so that we test for genes that show more substantial changes due to treatment, we simply supply a value on the log2 scale. For example, by specifying lfcThreshold = 1, we test for genes that show significant effects of treatment on gene counts more than doubling or less than halving.
+
+#### Threshold of 0.05
+
+```{r comment=NA, message=FALSE}
+res.05 <- results(dds, alpha = 0.05)
+table(res.05$padj < 0.05) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+#### Log2 Fold Change Threshold
+
+```{r comment=NA, message=FALSE}
+resLFC1 <- results(dds, lfcThreshold=1)
+table(resLFC1$padj < 0.1) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+In high-throughput biology, we are careful to not use the p values directly as evidence against the null, but to correct for multiple testing. There are `r sum(res$pvalue < 0.05, na.rm=TRUE)` genes with a p value below 0.05 among the `r sum(!is.na(res$pvalue))` genes for which the test succeeded in reporting a p value.
+
+If we consider a fraction of 10% false positives acceptable, we can consider all genes with an adjusted p value below 10% = 0.1 as significant: `r sum(res$padj < 0.1, na.rm=TRUE)`
+
+We subset the results table to these genes and then sort it by the log2 fold change estimate to get the significant genes with the strongest down-regulation:
+
+```{r comment=NA, message=FALSE}
+resSig <- subset(res, padj < 0.1)
+head(resSig[ order(resSig$log2FoldChange), ]) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+...and with the strongest up-regulation:
+
+```{r comment=NA, message=FALSE}
+head(resSig[ order(resSig$log2FoldChange, decreasing = TRUE), ]) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+# Plot Results
+
+## Counts Plot
+
+From the description of the function, we know that normalized counts plus a pseudocount of 0.5 are shown by default. This is a quick way to visualize the counts for a particular gene. Here, that particular gene is *AMIGO2*.
+
+```{r comment=NA, message=FALSE}
+topGene <- rownames(res)[which.min(res$padj)]
+plotCounts(dds, gene = topGene, intgroup=c("treatment.ch1"))
+
+```
+
+## MA-plot
+
+An MA-plot provides a useful overview for the distribution of the estimated coefficients in the model, e.g. the comparisons of interest, across all genes. On the y-axis, the "M" stands for "minus" -- subtraction of log values is equivalent to the log of the ratio -- and on the x-axis, the "A" stands for "average". You may hear this plot also referred to as a mean-difference plot, or a Bland-Altman plot.
+
+The *DESeq2* package uses a Bayesian procedure to moderate (or "shrink") log2 fold changes from genes with very low counts and highly variable counts, as can be seen by the narrowing of the vertical spread of points on the left side of the MA-plot, which we can see below. The *lfcShrink* function performs this operation.
+
+We wanted to shrink the noisy log2 fold changes and how this difference effects the data, so we applied statistical moderation. Therefore we included two different plots; with statistical moderation and without statistical moderation. We can also detect the individual points in our graph.
+
+The grey dots represent non significant genes for our dataset. We can see how different our samples are in terms of read counts. The data points converge to zero at Y-axis because log (A/A) is zero.
+
+Another useful diagnostic plot is the histogram of the p values. This plot is best formed by excluding genes with very small counts, which otherwise generate spikes in the histogram.
+
+### With Statistical Moderation
+
+```{r comment=NA, message=FALSE}
+library("apeglm")
+# resultsNames(dds)
+res <- lfcShrink(dds, coef="characteristics_ch1.1_treatment..Plated.on.Soft.get_vs_treatment..Plated.on.Hard.gel", type="apeglm")
+plotMA(res, ylim = c(-5, 5))
+```
+
+### MA Plot With Labeling Individual Points
+
+```{r comment=NA, message=FALSE}
+plotMA(res, ylim = c(-5,5))
+topGene <- rownames(res)[which.min(res$padj)]
+with(res[topGene, ], {
+  points(baseMean, log2FoldChange, col="green", cex=2, lwd=2)
+  text(baseMean, log2FoldChange, topGene, pos=2, col="green")
+})
+```
+
+### Without Statistical Moderation
+
+```{r comment=NA, message=FALSE}
+res.noshr <- results(dds, name="characteristics_ch1.1_treatment..Plated.on.Soft.get_vs_treatment..Plated.on.Hard.gel")
+plotMA(res.noshr, ylim = c(-5, 5))
+```
+
+### Histogram
+
+```{r comment=NA, message=FALSE}
+hist(res$pvalue[res$baseMean > 1], breaks = 0:20/20,
+     col = "#CDC8B1", border = "#8B8878", main= "Histogram of Frequency", xlab = "Base mean > 1")
+```
+
+As we can see, there is only one outlier, with a really high frequency, but the rest has mostly similar frequencies.
+
+## Gene Clustering
+
+```{r comment=NA, message=FALSE}
+library("genefilter")
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+mat  <- assay(vsd)[ topVarGenes, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd)[, c("characteristics_ch1.1","treatment.ch1")])
+pheatmap(mat, annotation_col = anno, fontsize_row = 5)
+```
+
+In the previous plot, we can see the heatmap of relative VST-transformed values across samples. In the heatmap, the dendrogram at the side shows us a hierarchical clustering of the samples. Such clustering can also be performed for the genes. Since the clustering is only relevant for genes that carry a signal, one usually would only cluster a subset of the most highly variable genes.
+
+# Annotating results
+
+The result table for the dataset we chose contains the Ensembl, Alias and Symbol gene IDs. Bioconductor's annotation packages help with mapping various ID schemes to each other.
+
+We are using genome wide annotation for Human, primarily based on mapping using Entrez Gene identifiers.
+
+```{r comment=NA, message=FALSE}
+columns(org.Hs.eg.db)
+```
+
+The *mapIds* function was used to add individual columns to our results table, which will be used further in the process.
+
+The function *select* returns a data frame, while *mapIds* returns a vector.
+
+```{r comment=NA, message=FALSE}
+
+#compare with your GENE ID and find the match
+rownames(counts(dds))%>%head
+database<-org.Hs.eg.db
+columns(database)
+
+# Functions: mapIds, select
+#mapIds returns a vector
+dfannotation1<-AnnotationDbi::select(x=database,
+                                     keys = rownames(counts(dds)),
+                                     column = c("ENSEMBL", "ENTREZID"),
+                                     keytype = "SYMBOL",
+                                     multiVals = "first")
+
+dfannotation1%>%head(5)
+
+dfannotation2<-mapIds(x=database,
+                      keys = rownames(counts(dds)),
+                      column = "ENSEMBL",
+                      keytype = "ALIAS",
+                      multiVals = "first")
+dfannotation2%>%head(5)
+
+
+duplicates<-dfannotation2[duplicated(dfannotation2)]
+```
+
+```{r comment=NA, message=FALSE}
+saveRDS(ddsfresh, file = "dds.rds")
+# Restore the object
+ddsN<-readRDS(file = "dds.rds")
+
+
+df2<-as.data.frame(counts(ddsN))
+colData<-colData(ddsN)
+metadata<-metadata(ddsN)
+database<-org.Hs.eg.db
+symbols <- AnnotationDbi::select(database, keys = rownames(df2),
+                                 column = c("SYMBOL"), keytype = "ALIAS")
+#df2joined<-cbind(df2,symbols) #may not work properly if order is switched at some points
+df2%>%mutate(RowNames=rownames(.))%>%right_join(symbols,by=c("RowNames"="ALIAS"))%>%filter(!is.na(SYMBOL))->dfjoined
+dfjoined%>%select_if(is.numeric)->dfannotated
+unique.col1 = make.names(dfjoined[,"SYMBOL"], unique=T)
+rownames(dfannotated)<-unique.col1
+symbols <- AnnotationDbi::select(database, keys = rownames(df2),
+                                 column = "ENSEMBL", keytype = "SYMBOL")
+
+dfjoined %>% head(5) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), )
+```
+
+## Volcano Plot
+
+Volcano Plot is good for identifying changes in large data sets composed of replicate data. It combines a measure of statistical significance from a statistical test with the magnitude of the change, enabling quick visual identification of those data-points like genes. This way we can plot significance versus fold-change on the y and x axes, respectively.
+
+```{r comment=NA, message=FALSE}
+dfjoined%>%select_if(is.numeric)->dfannotated
+unique.col1 = make.names(dfjoined[,"SYMBOL"], unique=T)
+rownames(dfannotated)<-unique.col1
+dds <- DESeq(dds, betaPrior=FALSE)
+dds$characteristics_ch1 <- as.factor(dds$characteristics_ch1)
+dds$characteristics_ch1.1 <- as.factor(dds$characteristics_ch1.1)
+EnhancedVolcano(res,
+                lab = rownames(res),
+                x = 'log2FoldChange',
+                y = 'pvalue')
+```
+
+## Bar Plot of Expressed Characteristics
+
+Bar plot is the most widely used method to visualize enriched terms. A *barplot* is used to display the relationship between a numeric and a categorical variable. It depicts the enrichment scores and gene count or ratio as bar height and color.
+
+```{r comment=NA, message=FALSE, warning=FALSE}
+database<-org.Hs.eg.db #org.Mm.eg.db, org.Hs.eg.db
+dds<-readRDS(file = "dds.rds")
+
+
+#from DiffExprAnal we found these genes to be differentially expressed. 
+ddsGO <- DESeq(dds)
+resGO <- results(ddsGO, contrast=c("characteristics_ch1.1","treatment..Plated.on.Soft.get","treatment..Plated.on.Hard.gel"))
+resGO<-resGO[!is.na(resGO$padj),]
+SigExpGenes<-resGO[(resGO$padj < 0.05) & (abs(resGO$log2FoldChange)>1),] 
+ggo1 <- groupGO(gene     = rownames(SigExpGenes),
+                OrgDb    = database,
+                keyType = "SYMBOL",
+                ont      = "BP",
+                level    = 1,
+                readable = F)
+ggo2 <- groupGO(gene     = rownames(SigExpGenes),
+                OrgDb    = database,
+                keyType = "SYMBOL",
+                ont      = "BP",
+                level    = 2,
+                readable = F)
+ego <- enrichGO(gene          = rownames(SigExpGenes),
+                universe      = rownames(counts(ddsGO)),
+                OrgDb         = org.Hs.eg.db,
+                keyType       = 'SYMBOL',
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05,
+                qvalueCutoff  = 0.05,
+                readable      = F)
+
+dfego<-as.data.frame(ego[,-8])
+dfego[dfego$p.adjust<ego@pvalueCutoff & dfego$pvalue<ego@pvalueCutoff & dfego$qvalue<ego@qvalueCutoff,2]
+barplot(ego, showCategory = 12)
+```
+
+Earlier we presented 148 biological characteristics and pathways that were identified regarding the present genes in sample. However, we used the bar plot to express the same but based on the adjusted p value. Hence, as it can be seen, response to lipopolysaccharide, cellular reponse to fatty acids and response to molecule of origin, are the three characteristics connected with the highest values of adjusted p value, and therefore with the most up regulated genes.
+
+## Gene Concept Network Plot
+
+Since the *barplot* is only displaying most significant enriched terms, we chose to use cneplot, which extracts complex associations (linkages of genes and biological concepts as a network), to provide more information, for example, which genes are associated with the terms.
+
+```{r comment=NA, message=FALSE, warning=FALSE}
+cnetplot(ego, categorySize = "pvalue", foldChange = rownames(SigExpGenes))
+```
+
+# Gene Enrichment Analysis
+
+## Significantly Expressed Genes
+
+To better comprehend the data, we can generate a dataset of significantly expressed genes. Gene expression is the process by which the information encoded in a gene is used to drive the construction of a protein molecule, hence, it is important to know which genes are expressed.
+
+```{r comment=NA, message=FALSE, warning=FALSE}
+SigExpGenes$ENTREZID<-AnnotationDbi::mapIds(x=database,
+                                            keys = rownames(SigExpGenes),
+                                            column = "ENTREZID",
+                                            keytype = "SYMBOL",
+                                            multiVals = "first")
+
+SigExpGenes%>%head
+
+kk <- enrichKEGG(gene         = SigExpGenes$ENTREZID,
+                 organism     = 'hsa',
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.2,
+                 pvalueCutoff = 0.05)
+
+kkres<-as.data.frame(kk@result)
+```
+
+As we can see below, significantly expressed genes are related to diseases hepatitis C and influenza A.
+
+```{r comment=NA, message=FALSE, warning=FALSE}
+significantkkres<-kkres[kkres$pvalue<kk@pvalueCutoff & kkres$p.adjust<kk@pvalueCutoff & kkres$qvalue < kk@qvalueCutoff,2,drop=F]
+significantkkres
+links<-sapply(rownames(head(kk)),function(x){browseKEGG(kk, x)})
+geneList<-SigExpGenes$log2FoldChange
+names(geneList)<-SigExpGenes$ENTREZID
+```
+
+## KEGG Pathways
+
+Another important set of informations is related to a biological pathway in which the gene is included in. We can use the function *pathview* to visualize KEGG pathways. Hence, the following example illustrates how to visualize the ***hsa05160*** or ***hsa05164*** pathway, which was enriched in our previous analysis.
+
+```{r}
+# hsa05160
+hsa05160 <- pathview(gene.data  = geneList,
+ pathway.id = "hsa05160",
+ species    = "hsa",
+ limit      = list(gene=max(abs(geneList)), cpd=1))
+
+# hsa05164
+hsa05164 <- pathview(gene.data  = geneList,
+ pathway.id = "hsa05164",
+ species    = "hsa",
+ limit      = list(gene=max(abs(geneList)), cpd=1))
+```
+
+```{r comment=NA, message=FALSE, warning=FALSE, echo=FALSE}
+#browseKEGG(kk, "hsa05160")
+#browseKEGG(kk, "hsa05164")
+
+download.pathway<-function(keggid){
+  folder<-"pics"
+  if (!("pics" %in% list.files())) {dir.create(folder)}
+  setwd(folder)
+  pic <- pathview(gene.data  = geneList,
+                  pathway.id = keggid,
+                  species    = stringr::str_extract(keggid,"[A-z]+"),
+                  limit      = list(gene=max(abs(geneList)), cpd=1))
+  setwd("..")
+}
+
+rownames(significantkkres)
+lapply(rownames(significantkkres),download.pathway)
+```
+
+![](pics/hsa05160.pathview.png) ![](pics/hsa05164.pathview.png)
+
+We can see the significantly expressed genes represented in the pathway map in shades of green.
+
+The tables of Ensembl data is downloadable with the BioMart data-mining tool so we are using BioMart to extract the data we need.
+
+The used datasets can be seen on the table given, with the Ensembl version.
+
+```{r comment=NA, message=FALSE, warning=FALSE}
+mkk <- enrichMKEGG(gene         = SigExpGenes$ENTREZID,
+                   organism     = 'hsa',
+                   pAdjustMethod = "BH",
+                   qvalueCutoff = 0.2,
+                   pvalueCutoff = 0.05)
+knitr::kable(head(mkk))
+mkkres<-as.data.frame(mkk@result)
+listMarts() %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+```{r comment=NA, message=FALSE}
+ensembl <- useMart("ensembl")
+datasets <- listDatasets(ensembl)
+ensembl = useDataset(datasets,mart=ensembl)
+filters = listFilters(ensembl)
+annotation1<-AnnotationDbi::select(x=database,
+                                   keys = rownames(counts(dds)),
+                                   column = c("ENTREZID","SYMBOL"),
+                                   keytype = "SYMBOL",
+                                   multiVals = "first")
+annotation2<-getBM(attributes=c("ensembl_gene_id","description","chromosome_name", 'entrezgene_id',"uniprot_gn_symbol","hgnc_symbol"), 
+                  filters = "entrezgene_id", 
+                  values =  annotation1$ENTREZID, 
+                  mart = ensembl)
+annotation2$entrezgene_id<-as.character(annotation2$entrezgene_id)
+annotation3<-annotation1%>%inner_join(annotation2, by=c('ENTREZID' = 'entrezgene_id'))
+```
+
+## Vizualization
+
+We can see the dataset as given for each group:
+
+```{r comment=NA, message=FALSE}
+counts(dds) %>% head(5) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+Now to create an understandable visualization we can use boxplots per group. First it can be seen on the left, boxplot 1, the plot is created by the boxplot function in R. In order to see any differences for the depth normalization, we also created the boxplot on the right side, for normalized counts.
+
+### Read Counts Only
+
+The simplest approach to quantifying gene expression by RNA-seq is to count the number of reads that map (align) to each gene (read count).
+
+As it can be seen below, usually genes pleated on hard gel have higher read counts than those on soft gel. However, we can't really see anything because the range of the read counts is so large that it covers several orders of magnitude.
+
+```{r comment=NA, message=FALSE}
+boxplot(counts(dds), main = "read counts only", cex = .6)
+```
+
+### Non-normalized
+
+Normalization is the process of scaling raw count values to account for the "uninteresting" factors. In this way the expression levels are more comparable between and/or within samples. As we can see, when non normalized, read counts are not aligned and are harder to understand.
+
+```{r comment=NA, message=FALSE}
+boxplot(log2(counts(dds)+1), notch=TRUE,
+        main = "Non-normalized read counts",
+        ylab="log2(read counts)", cex = .6)
+```
+
+### Normalized
+
+After applying normalization, we can say that the two groups slighty differ, since usually genes pleated on hard gel have higher number of read counts than those on soft gel.
+
+```{r comment=NA, message=FALSE}
+dds <- readRDS("dds.rds")
+dds <- DESeq(dds)
+counts.sf_normalized <- counts(dds, normalized=TRUE)
+boxplot(counts.sf_normalized, main = "Normalized", cex = .6)
+```
+
+### Normalized
+
+The size factor for each cell represents the estimate of the relative bias in that cell, so division of its counts by its size factor should remove that bias.
+
+```{r comment=NA, message=FALSE}
+boxplot(log2(counts(dds, normalize= TRUE) +1), notch=TRUE,
+        main = "Size-factor-normalized read counts",
+        ylab="log2(read counts)", cex = .6)
+```
+
+### VSD Normalization via VST
+
+```{r comment=NA, message=FALSE}
+vsd<-vst(dds)
+df2<-as.data.frame(assay(vsd))
+ggplot(data = melt(df2), aes(x=variable, y=value)) + geom_boxplot(aes(fill=variable))
+```
+
+### Dispersion Plot
+
+We can also use dispersion plot in our data to understand per-gene dispersion estimates together with the fitted mean-dispersion relationship. We can draw the plots by the function plotDispEsts in R.
+
+```{r comment=NA, message=FALSE}
+plotDispEsts(dds)
+```
+
+The DESeq2 dispersion estimates are inversely related to the mean and directly related to variance. Based on this relationship, the dispersion is higher for small mean counts and lower for large mean counts. The dispersion estimates for genes with the same mean will differ only based on their variance. Therefore, the dispersion estimates reflect the variance in gene expression for a given mean value. This red displayed curve plots the estimate for the expected dispersion value for genes of a given expression strength. Each black dot is a gene with an associated mean expression level and maximum likelihood estimation (MLE) of the dispersion. \### Rlog Normalization
+
+If we use the rlog normalization in our dataset, we can see the effects on the data by creating another boxplot, clustred by the group, LoxP and wild type (WT).
+
+We can see the first entries in our dataset as given below:
+
+### Boxplot with Rlog Normalization
+
+```{r comment=NA, message=FALSE}
+rld <- rlog(dds)
+assay(rld)%>%head(3) %>% kbl() %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+We can see in the boxplot that the data is coloured based on the group cluster.
+
+The mean values differ between the groups but not by a huge difference, rather by wiggling.
+
+There are outliers in each group, and the maximum value is similar nearly in all of them by minor differences.
+
+```{r comment=NA, message=FALSE}
+df3<-as.data.frame(assay(vsd))
+ggplot(data = melt(df3), aes(x=variable, y=value)) + geom_boxplot(aes(fill=variable))
+```
